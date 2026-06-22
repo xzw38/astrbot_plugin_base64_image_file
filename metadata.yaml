@@ -3,4 +3,4 @@ desc: 将发送结果中的 base64 图片转换为本地文件图片，兼容 KO
 help: 自动生效，无需命令。安装后重启 AstrBot 或重载插件即可。
 version: v0.1.0
 author: Codex
-repo: ""
+repo: "https://github.com/xzw38/astrbot_plugin_base64_image_file"

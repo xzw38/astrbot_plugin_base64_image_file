@@ -4,9 +4,8 @@ import time
 import uuid
 from pathlib import Path
 
-from astrbot.api import AstrBotConfig
-from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
 
@@ -19,7 +18,7 @@ except Exception:
 @register(
     "astrbot_plugin_base64_image_file",
     "Codex",
-    "将 base64:// 图片转换为本地文件图片，兼容 KOOK 等平台",
+    "Convert base64 images to local files for KOOK and other platforms",
     "0.1.0",
 )
 class Base64ImageFilePlugin(Star):
@@ -30,37 +29,81 @@ class Base64ImageFilePlugin(Star):
         self.cache_dir = base_dir / "base64_image_file"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.last_cleanup_time = 0.0
-        logger.info(f"[base64_image_file] 插件已加载，缓存目录: {self.cache_dir}")
+        logger.info(f"[base64_image_file] loaded, cache_dir={self.cache_dir}")
         self._cleanup_cache(force=True)
         self._patch_kook_image_upload()
+        self._patch_kook_send_chain()
 
     @filter.on_decorating_result(priority=100)
     async def convert_base64_images(self, event: AstrMessageEvent):
         result = event.get_result()
         chain = getattr(result, "chain", None) if result else None
         if not chain:
-            logger.debug("[base64_image_file] on_decorating_result 触发，但没有 result.chain")
             return
 
-        changed = False
-        new_chain = []
-        image_count = 0
+        platform = ""
+        try:
+            platform = event.get_platform_name()
+        except Exception:
+            pass
 
-        for component in chain:
-            if isinstance(component, Comp.Image):
-                image_count += 1
-                converted = self._convert_image(component)
-                if converted is not None:
-                    new_chain.append(converted)
-                    changed = True
-                    continue
-            new_chain.append(component)
-
+        new_chain, changed = self._convert_chain(chain, flatten_nodes=(platform == "kook"))
         if changed:
             result.chain = new_chain
-            logger.info("[base64_image_file] 已替换发送结果中的 base64 图片")
-        elif image_count:
-            logger.debug(f"[base64_image_file] 检测到 {image_count} 个图片组件，但不是 base64://")
+            logger.info(
+                f"[base64_image_file] converted outgoing chain for platform={platform or 'unknown'}"
+            )
+
+    def _convert_chain(self, chain, *, flatten_nodes: bool) -> tuple[list, bool]:
+        changed = False
+        new_chain = []
+        for component in chain:
+            converted_items, item_changed = self._convert_component(
+                component,
+                flatten_nodes=flatten_nodes,
+            )
+            new_chain.extend(converted_items)
+            changed = changed or item_changed
+        return new_chain, changed
+
+    def _convert_component(self, component, *, flatten_nodes: bool) -> tuple[list, bool]:
+        if isinstance(component, Comp.Image):
+            converted = self._convert_image(component)
+            return ([converted], True) if converted is not None else ([component], False)
+
+        if isinstance(component, Comp.Node):
+            content = list(getattr(component, "content", []) or [])
+            converted_content, changed = self._convert_chain(
+                content,
+                flatten_nodes=flatten_nodes,
+            )
+            if flatten_nodes:
+                return (converted_content, True)
+            if changed:
+                component.content = converted_content
+            return ([component], changed)
+
+        if isinstance(component, Comp.Nodes):
+            nodes = list(getattr(component, "nodes", []) or [])
+            if flatten_nodes:
+                flattened = []
+                changed = True
+                for node in nodes:
+                    items, _ = self._convert_component(node, flatten_nodes=True)
+                    flattened.extend(items)
+                return (flattened, changed)
+
+            changed = False
+            new_nodes = []
+            for node in nodes:
+                items, item_changed = self._convert_component(node, flatten_nodes=False)
+                new_nodes.extend(items)
+                changed = changed or item_changed
+            if changed:
+                component.nodes = new_nodes
+            return ([component], changed)
+
+        return ([component], False)
 
     def _convert_image(self, image: Comp.Image):
         file_value = getattr(image, "file", "") or getattr(image, "url", "") or ""
@@ -71,15 +114,15 @@ class Base64ImageFilePlugin(Star):
         if image_path is None:
             return None
 
-        logger.info(f"[base64_image_file] 已将 base64 图片转换为本地文件: {image_path}")
-        return Comp.Image.fromFileSystem(str(image_path))
+        logger.info(f"[base64_image_file] base64 image saved to {image_path}")
+        return Comp.Image(file=str(image_path), path=str(image_path))
 
     def _save_base64_image(self, file_value: str) -> Path | None:
         raw_base64 = file_value.removeprefix("base64://")
         try:
             image_bytes = base64.b64decode(raw_base64, validate=True)
         except (binascii.Error, ValueError) as exc:
-            logger.warning(f"[base64_image_file] base64 图片解码失败: {exc}")
+            logger.warning(f"[base64_image_file] failed to decode base64 image: {exc}")
             return None
 
         suffix = self._guess_suffix(image_bytes)
@@ -103,10 +146,11 @@ class Base64ImageFilePlugin(Star):
             files = [
                 item
                 for item in self.cache_dir.iterdir()
-                if item.is_file() and item.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+                if item.is_file()
+                and item.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
             ]
         except Exception as exc:
-            logger.warning(f"[base64_image_file] 扫描缓存目录失败: {exc}")
+            logger.warning(f"[base64_image_file] failed to scan cache dir: {exc}")
             return
 
         removed = 0
@@ -118,7 +162,7 @@ class Base64ImageFilePlugin(Star):
                         item.unlink()
                         removed += 1
                 except Exception as exc:
-                    logger.debug(f"[base64_image_file] 删除过期缓存失败: {item}, {exc}")
+                    logger.debug(f"[base64_image_file] failed to remove old cache {item}: {exc}")
 
         if max_files > 0:
             existing = []
@@ -136,10 +180,12 @@ class Base64ImageFilePlugin(Star):
                         item.unlink()
                         removed += 1
                     except Exception as exc:
-                        logger.debug(f"[base64_image_file] 删除超量缓存失败: {item}, {exc}")
+                        logger.debug(
+                            f"[base64_image_file] failed to remove overflow cache {item}: {exc}"
+                        )
 
         if removed:
-            logger.info(f"[base64_image_file] 已清理缓存图片 {removed} 张")
+            logger.info(f"[base64_image_file] cleaned cache files: {removed}")
 
     def _get_int_config(self, path: str, default: int) -> int:
         value = self.config
@@ -156,34 +202,58 @@ class Base64ImageFilePlugin(Star):
         try:
             from astrbot.core.platform.sources.kook.kook_event import KookEvent
         except Exception as exc:
-            logger.debug(f"[base64_image_file] 未加载 KOOK 适配器，跳过补丁: {exc}")
+            logger.debug(f"[base64_image_file] KOOK adapter not loaded, skip upload patch: {exc}")
             return
 
         original_wrap = getattr(KookEvent, "_wrap_message", None)
         if not callable(original_wrap):
-            logger.warning("[base64_image_file] 未找到 KookEvent._wrap_message，跳过补丁")
+            logger.warning("[base64_image_file] KookEvent._wrap_message not found")
             return
-        if getattr(KookEvent, "_base64_image_file_patched", False):
-            logger.info("[base64_image_file] KOOK 图片补丁已存在，跳过重复安装")
+        if getattr(KookEvent, "_base64_image_file_upload_patched", False):
+            logger.info("[base64_image_file] KOOK upload patch already installed")
             return
 
         plugin = self
 
         def patched_wrap(kook_event, index, message_component):
             if isinstance(message_component, Comp.Image):
-                file_value = getattr(message_component, "file", "") or ""
-                if isinstance(file_value, str) and file_value.startswith("base64://"):
-                    image_path = plugin._save_base64_image(file_value)
-                    if image_path is not None:
-                        logger.info(
-                            f"[base64_image_file] KOOK 发送前已将 base64 图片转换为本地文件: {image_path}"
-                        )
-                        message_component = Comp.Image(file=str(image_path), path=str(image_path))
+                converted = plugin._convert_image(message_component)
+                if converted is not None:
+                    message_component = converted
             return original_wrap(kook_event, index, message_component)
 
         KookEvent._wrap_message = patched_wrap
-        KookEvent._base64_image_file_patched = True
-        logger.info("[base64_image_file] 已安装 KOOK base64 图片发送补丁")
+        KookEvent._base64_image_file_upload_patched = True
+        logger.info("[base64_image_file] KOOK upload patch installed")
+
+    def _patch_kook_send_chain(self) -> None:
+        try:
+            from astrbot.core.platform.sources.kook.kook_event import KookEvent
+        except Exception as exc:
+            logger.debug(f"[base64_image_file] KOOK adapter not loaded, skip send patch: {exc}")
+            return
+
+        original_send = getattr(KookEvent, "send", None)
+        if not callable(original_send):
+            logger.warning("[base64_image_file] KookEvent.send not found")
+            return
+        if getattr(KookEvent, "_base64_image_file_send_patched", False):
+            logger.info("[base64_image_file] KOOK send patch already installed")
+            return
+
+        plugin = self
+
+        async def patched_send(kook_event, message: MessageChain):
+            chain = list(getattr(message, "chain", []) or [])
+            new_chain, changed = plugin._convert_chain(chain, flatten_nodes=True)
+            if changed:
+                logger.info("[base64_image_file] flattened/converted KOOK outgoing chain")
+                message = MessageChain(new_chain)
+            return await original_send(kook_event, message)
+
+        KookEvent.send = patched_send
+        KookEvent._base64_image_file_send_patched = True
+        logger.info("[base64_image_file] KOOK send patch installed")
 
     @staticmethod
     def _guess_suffix(data: bytes) -> str:

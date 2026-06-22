@@ -1,0 +1,6 @@
+name: astrbot_plugin_base64_image_file
+desc: 将发送结果中的 base64 图片转换为本地文件图片，兼容 KOOK 等不支持 base64:// 图片的平台
+help: 自动生效，无需命令。安装后重启 AstrBot 或重载插件即可。
+version: v0.1.0
+author: Codex
+repo: ""

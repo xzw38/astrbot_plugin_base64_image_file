@@ -1,8 +1,10 @@
 import base64
 import binascii
+import time
 import uuid
 from pathlib import Path
 
+from astrbot.api import AstrBotConfig
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
@@ -21,12 +23,15 @@ except Exception:
     "0.1.0",
 )
 class Base64ImageFilePlugin(Star):
-    def __init__(self, context: Context):
-        super().__init__(context)
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
+        super().__init__(context, config)
+        self.config = dict(config or {})
         base_dir = Path(get_astrbot_temp_path()) if get_astrbot_temp_path else Path("data")
         self.cache_dir = base_dir / "base64_image_file"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.last_cleanup_time = 0.0
         logger.info(f"[base64_image_file] 插件已加载，缓存目录: {self.cache_dir}")
+        self._cleanup_cache(force=True)
         self._patch_kook_image_upload()
 
     @filter.on_decorating_result(priority=100)
@@ -80,7 +85,72 @@ class Base64ImageFilePlugin(Star):
         suffix = self._guess_suffix(image_bytes)
         image_path = self.cache_dir / f"{uuid.uuid4().hex}{suffix}"
         image_path.write_bytes(image_bytes)
+        self._cleanup_cache()
         return image_path
+
+    def _cleanup_cache(self, *, force: bool = False) -> None:
+        now = time.time()
+        interval_minutes = self._get_int_config("cleanup.cleanup_interval_minutes", 10)
+        if not force and interval_minutes > 0:
+            if now - self.last_cleanup_time < interval_minutes * 60:
+                return
+        self.last_cleanup_time = now
+
+        max_age_hours = self._get_int_config("cleanup.max_age_hours", 24)
+        max_files = self._get_int_config("cleanup.max_files", 500)
+
+        try:
+            files = [
+                item
+                for item in self.cache_dir.iterdir()
+                if item.is_file() and item.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+            ]
+        except Exception as exc:
+            logger.warning(f"[base64_image_file] 扫描缓存目录失败: {exc}")
+            return
+
+        removed = 0
+        if max_age_hours > 0:
+            cutoff = now - max_age_hours * 3600
+            for item in files:
+                try:
+                    if item.stat().st_mtime < cutoff:
+                        item.unlink()
+                        removed += 1
+                except Exception as exc:
+                    logger.debug(f"[base64_image_file] 删除过期缓存失败: {item}, {exc}")
+
+        if max_files > 0:
+            existing = []
+            for item in files:
+                try:
+                    if item.exists():
+                        existing.append((item.stat().st_mtime, item))
+                except Exception:
+                    continue
+            existing.sort(key=lambda pair: pair[0])
+            overflow = len(existing) - max_files
+            if overflow > 0:
+                for _, item in existing[:overflow]:
+                    try:
+                        item.unlink()
+                        removed += 1
+                    except Exception as exc:
+                        logger.debug(f"[base64_image_file] 删除超量缓存失败: {item}, {exc}")
+
+        if removed:
+            logger.info(f"[base64_image_file] 已清理缓存图片 {removed} 张")
+
+    def _get_int_config(self, path: str, default: int) -> int:
+        value = self.config
+        for key in path.split("."):
+            if not isinstance(value, dict):
+                return default
+            value = value.get(key)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def _patch_kook_image_upload(self) -> None:
         try:

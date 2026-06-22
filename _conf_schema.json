@@ -1,0 +1,26 @@
+{
+  "cleanup": {
+    "type": "object",
+    "description": "缓存清理",
+    "items": {
+      "max_age_hours": {
+        "type": "int",
+        "description": "图片最长保留小时数",
+        "hint": "超过这个时间的缓存图片会被自动删除，设为 0 表示不按时间清理",
+        "default": 24
+      },
+      "max_files": {
+        "type": "int",
+        "description": "最多保留图片数量",
+        "hint": "缓存目录图片超过这个数量时，会优先删除最旧的图片，设为 0 表示不限制数量",
+        "default": 500
+      },
+      "cleanup_interval_minutes": {
+        "type": "int",
+        "description": "清理间隔分钟数",
+        "hint": "避免每次发送都扫描目录，设为 0 表示每次转换图片都检查清理",
+        "default": 10
+      }
+    }
+  }
+}
